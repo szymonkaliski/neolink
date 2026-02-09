@@ -466,22 +466,23 @@ pub struct RfAlarmCfg {
     #[serde(rename = "@version")]
     pub version: String,
     /// Rfid
-    #[serde(rename = "rfID")]
-    pub rf_id: u8,
+    #[serde(rename = "rfID", skip_serializing_if = "Option::is_none")]
+    pub rf_id: Option<u8>,
     /// PIR status
     pub enable: u8,
     /// PIR sensitivity
-    pub sensitivity: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<u8>,
     /// PIR sensivalue
     pub sensiValue: u8,
     /// reduce False alarm boolean
     pub reduceFalseAlarm: u8,
     /// XML time block for all week days
-    #[serde(rename = "timeBlockList")]
-    pub time_block_list: TimeBlockList,
+    #[serde(rename = "timeBlockList", skip_serializing_if = "Option::is_none")]
+    pub time_block_list: Option<TimeBlockList>,
     /// The alarm handle to attach to this Rf
-    #[serde(rename = "alarmHandle")]
-    pub alarm_handle: AlarmHandle,
+    #[serde(rename = "alarmHandle", skip_serializing_if = "Option::is_none")]
+    pub alarm_handle: Option<AlarmHandle>,
 }
 
 /// TimeBlockList XML
