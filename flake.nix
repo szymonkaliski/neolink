@@ -9,6 +9,40 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
+      packages = forAllSystems (pkgs: {
+        default = pkgs.rustPlatform.buildRustPackage {
+          pname = "neolink";
+          version = "0-unstable-${self.shortRev or self.dirtyShortRev or "unknown"}";
+
+          src = self;
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.rustPlatform.bindgenHook
+          ];
+
+          buildInputs = [
+            pkgs.openssl
+            pkgs.gst_all_1.gstreamer
+            pkgs.gst_all_1.gst-plugins-base
+            pkgs.gst_all_1.gst-plugins-good
+            pkgs.gst_all_1.gst-plugins-bad
+            pkgs.gst_all_1.gst-rtsp-server
+          ];
+
+          NIX_CFLAGS_COMPILE = "-Wno-error=int-conversion";
+
+          meta = {
+            description = "An RTSP bridge to Reolink IP cameras";
+            homepage = "https://github.com/QuantumEntangledAndy/neolink";
+            license = pkgs.lib.licenses.agpl3Plus;
+            mainProgram = "neolink";
+          };
+        };
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           nativeBuildInputs = [
