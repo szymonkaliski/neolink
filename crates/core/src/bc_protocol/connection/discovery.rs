@@ -1018,9 +1018,11 @@ impl Drop for Discoverer {
     fn drop(&mut self) {
         log::trace!("Drop Discoverer");
         self.cancel.cancel();
-        let _gt = tokio::runtime::Handle::current().enter();
-        let mut handle = std::mem::take(&mut self.handle);
-        tokio::task::spawn(async move { while handle.get_mut().join_next().await.is_some() {} });
+        // Abort the spawned tasks rather than spawning a detached drain that
+        // join_next()s them: if any task doesn't observe the cancel, that drain
+        // (and the whole JoinSet) lives forever, leaking a Discoverer per
+        // discovery retry (~10 per failed-camera reconnect cycle).
+        self.handle.get_mut().abort_all();
         log::trace!("Dropped Discoverer");
     }
 }

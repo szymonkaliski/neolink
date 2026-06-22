@@ -300,6 +300,7 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
             .collect::<HashSet<_>>();
         let use_splash = camera_config.borrow().use_splash;
         let splash_pattern = camera_config.borrow().splash_pattern.to_string();
+        let idle_disconnect = camera_config.borrow().idle_disconnect;
 
         // This select is for changes to camera_config.stream
         break tokio::select! {
@@ -362,7 +363,11 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_1.wait_for(|ss| ss.contains(&StreamKind::Main)).await?;
+                        // idle_disconnect cams have no stream info until first woken; mount the real
+                        // factory immediately so a client's request wakes the camera on demand.
+                        if !idle_disconnect {
+                            supported_streams_1.wait_for(|ss| ss.contains(&StreamKind::Main)).await?;
+                        }
                         stream_main(camera.clone(), StreamKind::Main, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Main) => v,
                     v = async {
@@ -396,7 +401,9 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                         }
                         log::debug!("{}: Preparing at {}", name, paths.join(", "));
 
-                        supported_streams_2.wait_for(|ss| ss.contains(&StreamKind::Sub)).await?;
+                        if !idle_disconnect {
+                            supported_streams_2.wait_for(|ss| ss.contains(&StreamKind::Sub)).await?;
+                        }
 
                         stream_main(camera.clone(), StreamKind::Sub, rtsp, &permitted_users, &paths).await
                     }, if active_streams.contains(&StreamKind::Sub) => v,

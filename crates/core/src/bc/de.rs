@@ -90,8 +90,11 @@ fn bc_modern_msg<'a>(
         E::add_context(input, ctx, E::from_error_kind(input, kind))
     }
 
-    // If missing payload_offset treat all as payload
-    let ext_len = header.payload_offset.unwrap_or_default();
+    // If missing payload_offset treat all as payload. Clamp to body_len: some
+    // cameras report a payload_offset larger than body_len, which underflows
+    // payload_len below (panics in debug, wraps in release -> bogus take() ->
+    // the connection is torn down and retried in a tight loop).
+    let ext_len = header.payload_offset.unwrap_or_default().min(header.body_len);
 
     let (buf, ext_buf) = take(ext_len)(buf)?;
     let payload_len = header.body_len - ext_len;

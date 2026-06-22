@@ -1,9 +1,14 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
 use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_rtsp_server::prelude::RTSPMediaFactoryExt;
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -131,7 +136,7 @@ pub(super) async fn make_dummy_factory(
     use_splash: bool,
     pattern: String,
 ) -> AnyResult<NeoMediaFactory> {
-    NeoMediaFactory::new_with_callback(move |element| {
+    let factory = NeoMediaFactory::new_with_callback(move |element| {
         clear_bin(&element)?;
         if !use_splash {
             Ok(None)
@@ -140,7 +145,10 @@ pub(super) async fn make_dummy_factory(
             Ok(Some(element))
         }
     })
-    .await
+    .await?;
+    factory.set_shared(true);
+    factory.set_eos_shutdown(true);
+    Ok(factory)
 }
 
 enum ClientMsg {
@@ -150,13 +158,32 @@ enum ClientMsg {
     },
 }
 
+/// Per-stream circuit breaker.
+///
+/// An unreachable camera (dead battery etc.) otherwise makes every client request start a
+/// fresh ~40s blocking stream-learn. go2rtc retries stack these up, each one blocking an rtsp
+/// server thread and leaking its connection, until gstreamer can no longer build pipelines
+/// ("could not create element") and even healthy cameras break. The breaker serialises learns
+/// (one in flight per stream) and, after a failure, fast-rejects requests for a growing
+/// cooldown so a dead camera costs almost nothing. A successful learn resets it, so a
+/// recharged camera recovers on its own.
+#[derive(Default)]
+struct Breaker {
+    in_flight: bool,
+    fails: u32,
+    down_until: Option<Instant>,
+}
+
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
+    let breaker = Arc::new(Mutex::new(Breaker::default()));
+    let thread_breaker = breaker.clone();
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
+        let breaker = thread_breaker;
         let name = camera.config().await?.borrow().name.clone();
 
         while let Some(msg) = client_rx.recv().await {
@@ -165,31 +192,51 @@ pub(super) async fn make_factory(
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let breaker = breaker.clone();
                     tokio::task::spawn(async move {
+                        let bname = name.clone();
+                        let result: AnyResult<()> = async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
 
                         // Start the camera
                         let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
-                        // Learn the camera data type
-                        let mut buffer = vec![];
-                        let mut frame_count = 0usize;
-
-                        let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                        // Learn the camera data type, bounded with a timeout. An unreachable camera
+                        // (e.g. a dead battery cam) hangs forever in stream_while_live /
+                        // get_stream_info / recv(); without this bound gstreamer never tears the media
+                        // down, so the client socket stays in CLOSE_WAIT and leaks the fd (this is what
+                        // pegged the fd ulimit). A reachable camera completes this within the wake window.
+                        let learn = async {
+                            let mut media_rx = camera.stream_while_live(stream).await?;
+                            let mut buffer = vec![];
+                            let mut frame_count = 0usize;
+                            let mut stream_config = StreamConfig::new(&camera, stream).await?;
+                            while let Some(media) = media_rx.recv().await {
+                                stream_config.update_from_media(&media);
+                                buffer.push(media);
+                                if frame_count > 10
+                                    || (stream_config.vid_type.is_some()
+                                        && stream_config.aud_type.is_some())
+                                {
+                                    break;
+                                }
+                                frame_count += 1;
                             }
-                            frame_count += 1;
-                        }
+                            AnyResult::Ok((media_rx, buffer, stream_config))
+                        };
+                        let (mut media_rx, mut buffer, stream_config) =
+                            match tokio::time::timeout(std::time::Duration::from_secs(40), learn).await
+                            {
+                                Ok(Ok(v)) => v,
+                                Ok(Err(e)) => return Err(e),
+                                Err(_) => {
+                                    return Err(anyhow::anyhow!(
+                                        "{name}::{stream}: stream setup timed out (unreachable), aborting media"
+                                    ));
+                                }
+                            };
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
@@ -261,6 +308,7 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
+                            let mut last_consumed = std::time::Instant::now();
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
@@ -275,11 +323,46 @@ pub(super) async fn make_factory(
                                     log::info!("Failed to send to source: {r:?}");
                                 }
                                 r?;
+                                // A draining buffer means a client is consuming. If it stays full
+                                // (nobody watching) past the grace period, stop so the camera can
+                                // idle-disconnect. The window must outlast a slow wake so a retry can
+                                // attach to the shared media (see set_shared in make_factory).
+                                let draining = vid_src
+                                    .as_ref()
+                                    .map(|s| s.current_level_bytes() <= s.max_bytes() / 3)
+                                    .unwrap_or(true);
+                                if draining {
+                                    last_consumed = std::time::Instant::now();
+                                } else if last_consumed.elapsed() > std::time::Duration::from_secs(45) {
+                                    log::info!("{name}::{stream}: no client consuming for 45s, stopping");
+                                    break;
+                                }
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())
+                        }
+                        .await;
+                        // Update the circuit breaker for this stream.
+                        {
+                            let mut b = breaker.lock().unwrap_or_else(|e| e.into_inner());
+                            b.in_flight = false;
+                            if result.is_ok() {
+                                b.fails = 0;
+                                b.down_until = None;
+                            } else {
+                                b.fails = b.fails.saturating_add(1);
+                                let backoff =
+                                    Duration::from_secs((15u64 * b.fails as u64).min(120));
+                                b.down_until = Some(Instant::now() + backoff);
+                                log::warn!(
+                                    "{bname}::{stream}: stream setup failed (x{}); fast-rejecting requests for {:?}",
+                                    b.fails, backoff
+                                );
+                            }
+                        }
+                        result
                     });
                 }
             }
@@ -289,13 +372,38 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
+        // Circuit breaker: fast-reject if a learn is already running for this stream, or if
+        // recent learns failed (camera unreachable). This is what stops go2rtc retries from
+        // stacking 40s blocking learns that exhaust the rtsp thread pool and leak connections.
+        {
+            let mut b = breaker.lock().unwrap_or_else(|e| e.into_inner());
+            if b.in_flight {
+                return Err(anyhow!("stream setup already in progress"));
+            }
+            if let Some(t) = b.down_until {
+                if Instant::now() < t {
+                    return Err(anyhow!("camera unreachable; circuit open"));
+                }
+            }
+            b.in_flight = true;
+        }
         let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
+        if let Err(e) = client_tx.blocking_send(ClientMsg::NewClient { element, reply }) {
+            breaker.lock().unwrap_or_else(|x| x.into_inner()).in_flight = false;
+            return Err(e.into());
+        }
 
         let element = new_element.blocking_recv()?;
         Ok(Some(element))
     })
     .await?;
+    // Share one media across clients so a slow first wake doesn't orphan a media
+    // that holds the stream, letting a retry attach to it. We deliberately do NOT
+    // set_eos_shutdown: a battery cam's wake (~30s) flickers the client and EOS would
+    // tear the media down mid-wake before the retry can attach. Instead the streaming
+    // thread stops itself after a no-consumer grace period (see make_factory loop),
+    // which lets the camera idle-disconnect cleanly once nobody is watching.
+    factory.set_shared(true);
     Ok((factory, thread))
 }
 

@@ -1,12 +1,24 @@
 use std::sync::{Arc, Weak};
 use tokio::{
     sync::watch::{Receiver as WatchReceiver, Sender as WatchSender},
-    time::{interval, sleep, timeout, Duration, Instant},
+    time::{interval, sleep, timeout, Duration},
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{config::CameraConfig, utils::connect_and_login, AnyResult};
 use neolink_core::bc_protocol::BcCamera;
+
+// Reconnect backoff: grows (doubling) while a camera can't be reached and resets
+// once it actually connects, so an offline camera is retried rarely instead of
+// hammered (which otherwise pegged a CPU core). The cap is large so a camera that
+// is offline for a long time (e.g. a battery cam left uncharged) settles into
+// occasional retries rather than a continuous reconnect/discovery loop.
+const MIN_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
+// Keepalive (get_linktype) misses tolerated before declaring the camera dead. Generous so a
+// flaky-but-streaming battery cam isn't torn down into a reconnect loop (see neolink#14);
+// real disconnects are caught by camera.join(), not this counter.
+const MAX_MISSED_PINGS: u32 = 30;
 
 #[derive(Eq, PartialEq, Copy, Clone)]
 pub(crate) enum NeoCamThreadState {
@@ -35,11 +47,14 @@ impl NeoCamThread {
             camera_watch: camera_watch_tx,
         }
     }
-    async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
+    async fn run_camera(&mut self, config: &CameraConfig, backoff: &mut Duration) -> AnyResult<()> {
         let name = config.name.clone();
         log::trace!("Attempting connection with config: {config:?}");
         let camera = Arc::new(connect_and_login(config).await?);
         log::trace!("  - Connected");
+        // Connection succeeded: reset the reconnect backoff. A camera that never
+        // gets here (offline) keeps its grown backoff instead of hammering.
+        *backoff = MIN_BACKOFF;
 
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
         if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
@@ -80,8 +95,14 @@ impl NeoCamThread {
                             break Err(e.into());
                         },
                         Err(_) => {
-                            // Timeout
-                            if missed_pings < 5 {
+                            // Timeout. Be tolerant: flaky battery cams (Argus) intermittently stop
+                            // answering get_linktype while still streaming fine. Dropping them after
+                            // only ~5 missed pings (~30s) caused a reconnect loop (cf. neolink#14)
+                            // that never let the stream stabilise and churned reconnects hard enough
+                            // to trigger the runaway-CPU spin. A genuine connection drop is caught by
+                            // camera.join() above; this ping is only a secondary liveness check, so
+                            // allow many misses (~5 min) before giving up.
+                            if missed_pings < MAX_MISSED_PINGS {
                                 missed_pings += 1;
                                 continue;
                             } else {
@@ -105,9 +126,6 @@ impl NeoCamThread {
     // A watch sender is used to send the new camera
     // whenever it changes
     pub(crate) async fn run(&mut self) -> AnyResult<()> {
-        const MAX_BACKOFF: Duration = Duration::from_secs(5);
-        const MIN_BACKOFF: Duration = Duration::from_millis(50);
-
         let mut backoff = MIN_BACKOFF;
 
         loop {
@@ -118,7 +136,6 @@ impl NeoCamThread {
             let mut config_rec = self.config.clone();
 
             let config = config_rec.borrow_and_update().clone();
-            let now = Instant::now();
             let name = config.name.clone();
 
             let mut state = self.state.clone();
@@ -131,7 +148,7 @@ impl NeoCamThread {
                     log::trace!("State changed to disconnect");
                     None
                 }
-                v = self.run_camera(&config) => {
+                v = self.run_camera(&config, &mut backoff) => {
                     Some(v)
                 }
             };
@@ -147,14 +164,6 @@ impl NeoCamThread {
 
             // Else we see what the result actually was
             let result = res.unwrap();
-
-            if now.elapsed() > Duration::from_secs(60) {
-                // Command ran long enough to be considered a success
-                backoff = MIN_BACKOFF;
-            }
-            if backoff > MAX_BACKOFF {
-                backoff = MAX_BACKOFF;
-            }
 
             match result {
                 Ok(()) => {
@@ -179,7 +188,7 @@ impl NeoCamThread {
                             log::warn!("{name}: Connection Lost: {:?}", e);
                             log::info!("{name}: Attempt reconnect in {:?}", backoff);
                             sleep(backoff).await;
-                            backoff *= 2;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
                         }
                     }
                 }

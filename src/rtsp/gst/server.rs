@@ -57,6 +57,16 @@ impl NeoRtspServer {
         auth.set_default_token(Some(&mut un_authtoken));
         factory.set_auth(Some(&auth));
 
+        // Serve clients concurrently. The default RTSPThreadPool has max-threads=1, so a single
+        // blocking stream-setup (a waking or unreachable camera) stalls the one client thread:
+        // further connections are accepted but never serviced or closed, piling up as unreaped
+        // CLOSE_WAIT sockets until the fd limit is hit (the original outage). A real pool lets a
+        // slow/dead camera block only its own thread while other cameras and connection cleanup
+        // keep running.
+        if let Some(pool) = factory.thread_pool() {
+            pool.set_max_threads(32);
+        }
+
         factory.connect_client_connected(|_, client| {
             client.connect_new_session(|_, session| {
                 log::debug!("New Session");

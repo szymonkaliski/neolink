@@ -60,7 +60,14 @@ impl NeoCam {
         let (watch_config_tx, watch_config_rx) = watch(config.clone());
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
-        let (state_tx, state_rx) = watch(NeoCamThreadState::Connected);
+        // idle_disconnect cameras connect on demand; starting Connected makes the
+        // cam thread hold a never-requested camera awake forever (drains battery
+        // cams and chases offline ones).
+        let (state_tx, state_rx) = watch(if config.idle_disconnect {
+            NeoCamThreadState::Disconnected
+        } else {
+            NeoCamThreadState::Connected
+        });
         let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
@@ -204,7 +211,7 @@ impl NeoCam {
                     AnyResult::Ok(())
                 }
                 v = async {
-                    let version = report_instance.run_task(|cam| Box::pin(
+                    let version = report_instance.run_passive_task(|cam| Box::pin(
                         async move {
                             Ok(cam.version().await?)
                         }
@@ -212,7 +219,7 @@ impl NeoCam {
                     log::info!("{}: Model {}", report_name, version.model.unwrap_or("Undeclared".to_string()));
                     log::info!("{}: Firmware Version {}", report_name, version.firmwareVersion);
 
-                    let stream_info = report_instance.run_task(|cam| Box::pin(
+                    let stream_info = report_instance.run_passive_task(|cam| Box::pin(
                         async move {
                             Ok(cam.get_stream_info().await?)
                         }
@@ -238,7 +245,7 @@ impl NeoCam {
                     AnyResult::Ok(())
                 },
                 v = async {
-                    let uid = uid_instance.run_task(|cam| Box::pin(async move {
+                    let uid = uid_instance.run_passive_task(|cam| Box::pin(async move {
                         let uid = cam.uid().await?;
                         Ok(uid)
                     })).await?;
