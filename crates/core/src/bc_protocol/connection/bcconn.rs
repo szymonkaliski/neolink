@@ -7,7 +7,7 @@ use log::*;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, error::TrySendError, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
@@ -114,7 +114,12 @@ impl BcConnection {
     }
 
     pub async fn subscribe(&self, msg_id: u32, msg_num: u16) -> Result<BcSubscription> {
-        let (tx, rx) = channel(100);
+        // Large buffer: a single H264 keyframe is split across ~150 BC messages and a battery
+        // (Argus) cam bursts the whole keyframe at once. With a small buffer the poller either
+        // blocks (starving this camera's keepalive, so the cam drops the session) or drops a
+        // mid-keyframe chunk (reassembly stalls) -- both kill the stream after one keyframe. A
+        // big buffer absorbs the burst so the keyframe completes and keepalives keep flowing.
+        let (tx, rx) = channel(2048);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), tx))
             .await?;
@@ -309,19 +314,25 @@ impl Poller {
                                         None
                                     };
                                     if let Some(sender) = sender {
-                                        // Non-blocking fan-out: a single Poller dispatches to every
-                                        // subscriber, so blocking here on one full/slow consumer's
-                                        // channel stalls dispatch to ALL cameras (head-of-line wedge
-                                        // -- an offline cam's retry storm or a stalled stream would
-                                        // take the whole bridge down, which is the runaway/503 wedge
-                                        // we hit). Drop the message for the lagging subscriber
-                                        // instead; live video recovers at the next keyframe.
-                                        if sender.try_send(Ok(response)).is_err() {
-                                            trace!(
-                                                "dropping message for lagging/closed subscriber {} (ID: {})",
-                                                &msg_num,
-                                                &msg_id
-                                            );
+                                        // One poller per camera fans messages out to per-subscriber
+                                        // channels. Closed subscriber (e.g. an offline cam whose
+                                        // consumer went away): drop, don't let it wedge this camera.
+                                        // Full (slow consumer): backpressure rather than drop --
+                                        // dropping a mid-keyframe chunk stalls H264 reassembly. The
+                                        // large channel makes Full rare; a genuinely stuck consumer
+                                        // only slows its own camera (pollers are per-camera).
+                                        match sender.try_send(Ok(response)) {
+                                            Ok(()) => {}
+                                            Err(TrySendError::Closed(_)) => {
+                                                trace!(
+                                                    "dropping message for closed subscriber {} (ID: {})",
+                                                    &msg_num,
+                                                    &msg_id
+                                                );
+                                            }
+                                            Err(TrySendError::Full(msg)) => {
+                                                let _ = sender.send(msg).await;
+                                            }
                                         }
                                     } else {
                                         trace!(
