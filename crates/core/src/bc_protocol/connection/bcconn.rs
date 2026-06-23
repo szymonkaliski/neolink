@@ -309,25 +309,20 @@ impl Poller {
                                         None
                                     };
                                     if let Some(sender) = sender {
-                                        if sender.capacity() == 0 {
-                                            warn!("Reaching limit of channel");
-                                            warn!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
-                                                &msg_num,
-                                                &msg_id
-                                            );
-                                        } else {
+                                        // Non-blocking fan-out: a single Poller dispatches to every
+                                        // subscriber, so blocking here on one full/slow consumer's
+                                        // channel stalls dispatch to ALL cameras (head-of-line wedge
+                                        // -- an offline cam's retry storm or a stalled stream would
+                                        // take the whole bridge down, which is the runaway/503 wedge
+                                        // we hit). Drop the message for the lagging subscriber
+                                        // instead; live video recovers at the next keyframe.
+                                        if sender.try_send(Ok(response)).is_err() {
                                             trace!(
-                                                "Remaining: {} of {} message space for {} (ID: {})",
-                                                sender.capacity(),
-                                                sender.max_capacity(),
+                                                "dropping message for lagging/closed subscriber {} (ID: {})",
                                                 &msg_num,
                                                 &msg_id
                                             );
                                         }
-                                        let _ = sender.send(Ok(response)).await;
                                     } else {
                                         trace!(
                                             "Ignoring uninteresting message id {} (number: {})",
@@ -350,7 +345,7 @@ impl Poller {
                         Err(e) => {
                             for sub in self.subscribers.num.values() {
                                 for sender in sub.values() {
-                                    let _ = sender.send(Err(e.clone())).await;
+                                    let _ = sender.try_send(Err(e.clone()));
                                 }
                             }
                             self.subscribers.num.clear();
