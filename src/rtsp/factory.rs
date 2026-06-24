@@ -215,6 +215,13 @@ pub(super) async fn make_factory(
                             let mut stream_config = StreamConfig::new(&camera, stream).await?;
                             while let Some(media) = media_rx.recv().await {
                                 stream_config.update_from_media(&media);
+                                // Start the buffer at a keyframe. h264parse/h265parse cannot parse
+                                // slices until they have the SPS/PPS that only arrive with an IFrame;
+                                // a long-GOP substream otherwise feeds a run of P-frames first and
+                                // never prerolls (every slice dropped as a "broken/invalid nal").
+                                if buffer.is_empty() && !matches!(media, BcMedia::Iframe(_)) {
+                                    continue;
+                                }
                                 buffer.push(media);
                                 if frame_count > 10
                                     || (stream_config.vid_type.is_some()
@@ -636,6 +643,17 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
+    // Declare the bytestream format explicitly. Without caps the appsrc cannot send a
+    // CAPS sticky event, so h264parse has to guess access-unit boundaries; that guess
+    // fails on multi-slice frames (each slice gets dropped as a "broken/invalid nal"),
+    // which is what kept multi-slice cameras (e.g. the E320) from ever prerolling.
+    source.set_caps(Some(
+        &Caps::builder("video/x-h264")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "au")
+            .build(),
+    ));
+
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
@@ -686,6 +704,14 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     source.set_max_bytes(buffer_size as u64);
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
+
+    // See pipe_h264: explicit caps so h265parse gets correct access-unit alignment.
+    source.set_caps(Some(
+        &Caps::builder("video/x-h265")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "au")
+            .build(),
+    ));
 
     let source = source
         .dynamic_cast::<Element>()
