@@ -1,6 +1,5 @@
 use gstreamer::ClockTime;
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -299,13 +298,11 @@ pub(super) async fn make_factory(
                         std::thread::spawn(move || {
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
-                            let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
                                     buffered,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -319,7 +316,6 @@ pub(super) async fn make_factory(
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
-                                    &mut pools,
                                     &vid_src,
                                     &aud_src,
                                     &mut vid_ts,
@@ -416,7 +412,6 @@ pub(super) async fn make_factory(
 
 fn send_to_sources(
     data: BcMedia,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u32,
@@ -429,12 +424,7 @@ fn send_to_sources(
             let duration = aac.duration().expect("Could not calculate AAC duration");
             if let Some(aud_src) = aud_src.as_ref() {
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    aac.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts as u64))?;
             }
             *aud_ts += duration;
         }
@@ -444,12 +434,7 @@ fn send_to_sources(
                 .expect("Could not calculate ADPCM duration");
             if let Some(aud_src) = aud_src.as_ref() {
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(
-                    aud_src,
-                    adpcm.data,
-                    Duration::from_micros(*aud_ts as u64),
-                    pools,
-                )?;
+                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts as u64))?;
             }
             *aud_ts += duration;
         }
@@ -457,7 +442,7 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64))?;
             }
             const MICROSECONDS: u32 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps;
@@ -467,12 +452,7 @@ fn send_to_sources(
     Ok(())
 }
 
-fn send_to_appsrc(
-    appsrc: &AppSrc,
-    data: Vec<u8>,
-    mut ts: Duration,
-    pools: &mut HashMap<usize, gstreamer::BufferPool>,
-) -> AnyResult<()> {
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -496,34 +476,16 @@ fn send_to_appsrc(
         }
     }
     let buf = {
-        let msg_size = data.len();
-
-        // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
-
-        // Get a buffer from the pool and then copy in the data
-        let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
-            let time = ClockTime::from_useconds(ts.as_micros() as u64);
-            gst_buf_mut.set_dts(time);
-            gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
-            gst_buf_data.copy_from_slice(data.as_slice());
-            drop(gst_buf_data);
-            new_buf
-        };
-
-        // Return the new buffer with the data
-        gst_buf
+        // One buffer per frame, zero-copy: the Vec becomes the buffer's memory and is freed once the
+        // pipeline consumes it. The previous code kept a gstreamer::BufferPool PER DISTINCT frame
+        // byte-size and never freed any of them; video frame sizes vary continuously, so that map
+        // grew without bound (~28MB/min of RSS while streaming, heading for OOM).
+        let time = ClockTime::from_useconds(ts.as_micros() as u64);
+        let mut new_buf = gstreamer::Buffer::from_mut_slice(data);
+        let gst_buf_mut = new_buf.get_mut().unwrap();
+        gst_buf_mut.set_dts(time);
+        gst_buf_mut.set_pts(time);
+        new_buf
     };
 
     // Push buffer into the appsrc
