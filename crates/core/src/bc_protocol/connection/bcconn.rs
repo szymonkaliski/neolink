@@ -90,12 +90,13 @@ impl BcConnection {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
                 v = async {
-                    loop {
-                        if let n @ Err(_) = poller.run().await {
-                            trace!("Polling has ended");
-                            return n;
-                        }
-                    }
+                    // poller.run() only returns when its command channel closes (the connection is
+                    // finished) or on error. Either way the connection is done, so end the task.
+                    // Re-running run() here would busy-loop: on a closed channel it returns Ok(())
+                    // immediately, spinning a core at ~100% with no I/O until the process restarts.
+                    let result = poller.run().await;
+                    trace!("Polling has ended");
+                    result
                 }=> v
             }
         });
