@@ -188,8 +188,23 @@ impl NeoInstance {
                         Box::pin(async move {
                             let mut media_stream = cam.start_video(stream, 0, strict).await?;
                             log::trace!("Camera started");
-                            while let Ok(media) = media_stream.get_data().await? {
-                                media_tx.send(media).await?;
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    // The consumer (RTSP client) went away. Stop pulling so the
+                                    // run_task use-permit drops and idle_disconnect can put a
+                                    // battery camera back to sleep. Without this the pump parks in
+                                    // get_data() on a silent/stalled camera and never observes the
+                                    // dropped receiver, so the use-counter never returns to zero and
+                                    // the camera stays connected (and awake) indefinitely.
+                                    _ = media_tx.closed() => break,
+                                    data = media_stream.get_data() => {
+                                        match data? {
+                                            Ok(media) => media_tx.send(media).await?,
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
                             }
                             AnyResult::Ok(())
                         })
