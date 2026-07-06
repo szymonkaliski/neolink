@@ -11,19 +11,28 @@
 //!
 //! - `/control/floodlight [on|off]` Turns floodlight (if equipped) on/off
 //! - `/control/led [on|off]` Turns status LED on/off
-//! - `/control/pir [on|off]` Turns PIR on/off
+//! - `/control/pir [on|off]` Sets the desired PIR state. The newest request is
+//!   held until the camera is reachable (surviving reconnects) and then
+//!   applied; a newer request supersedes an unapplied one. The applied state
+//!   is published retained to `/status/pir`.
 //! - `/control/ir [on|off|auto]` Turn IR lights on/off or automatically via light detection
 //! - `/control/reboot` Reboot the camera
 //! - `/control/ptz` [up|down|left|right|in|out] (amount) Control the PTZ movements, amount defaults to 32.0
 //! - `/control/ptz/preset` [id] Move the camera to a known preset
 //! - `/control/ptz/assign` [id] [name] Assign the current ptz position to an ID and name
 //!
+//! Commands reply `OK`/`FAIL` on their own topic; a command that does not
+//! complete within 60s (usually because the camera is unreachable) replies
+//! `FAIL`. A `control/pir` request additionally stays pending after such a
+//! `FAIL` and is still applied when the camera comes back.
+//!
 //! Status Messages:
 //!
 //! `/status offline` Sent when the neolink goes offline this is a LastWill message
 //! `/status disconnected` Sent when the camera goes offline
 //! `/status/battery` Sent in reply to a `/query/battery`
-//! `/status/pir` Sent in reply to a `/query/pir`
+//! `/status/pir` Retained `on`/`off`; published when a `control/pir` request
+//!    is applied and in reply to a `/query/pir`
 //! `/status/ptz/preset` Sent in reply to a `/query/ptz/preset`
 //!
 //! Query Messages:
@@ -61,10 +70,12 @@
 //!
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::{
     sync::mpsc::channel as mpsc,
+    sync::watch,
     task::JoinSet,
-    time::{interval, sleep, Duration, MissedTickBehavior},
+    time::{interval, sleep, timeout, Duration, MissedTickBehavior},
 };
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -91,6 +102,39 @@ use self::{
     discovery::enable_discovery,
     mqttc::{MqttInstance, MqttReply},
 };
+
+/// How long the handler of an incoming MQTT command may run before the
+/// dispatcher gives up and replies `FAIL` on the command's topic. Commands
+/// mostly stall because the camera is unreachable, so this bounds how long
+/// the sender waits to learn that delivery did not happen.
+const MQTT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The newest `control/pir` request for a camera
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PirRequest {
+    desired: bool,
+    seq: u64,
+}
+
+/// The outcome of the newest resolved [`PirRequest`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PirResolution {
+    seq: u64,
+    ok: bool,
+}
+
+/// Desired-state channel for a camera's PIR
+///
+/// `control/pir` messages overwrite `request`; the PIR task in
+/// [`listen_on_camera`] applies the newest request once the camera is
+/// reachable and records the outcome in `resolution`. A request that is
+/// superseded before it could be applied is never applied; it resolves
+/// together with the newest one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PirCommands {
+    request: Option<PirRequest>,
+    resolution: Option<PirResolution>,
+}
 
 /// Entry point for the mqtt subcommand
 ///
@@ -345,6 +389,10 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                 let camera_floodlight_tasks = camera.clone();
                 let mqtt_floodlight_tasks = mqtt_instance.resubscribe().await?;
 
+                let camera_pir = camera.clone();
+                let mqtt_pir = mqtt_instance.resubscribe().await?;
+                let pir_commands = Arc::new(watch::channel(PirCommands::default()).0);
+
                 tokio::select! {
                     _ = cancel.cancelled() => AnyResult::Ok(()),
                     // Handles incomming requests
@@ -358,11 +406,22 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                                     let camera_msg = camera_msg.clone();
                                     let tx = tx.clone();
                                     let cancel_msg = cancel_msg.clone();
+                                    let pir_msg = pir_commands.clone();
                                     set_msg.spawn(async move {
                                         tokio::select!{
                                             _ = cancel_msg.cancelled() => AnyResult::Ok(()),
                                             v = async {
-                                                let res = handle_mqtt_message(msg, &mqtt_msg, &camera_msg).await;
+                                                let topic = msg.topic.clone();
+                                                let res = match timeout(MQTT_COMMAND_TIMEOUT, handle_mqtt_message(msg, &mqtt_msg, &camera_msg, &pir_msg)).await {
+                                                    Ok(res) => res,
+                                                    Err(_) => {
+                                                        warn!("Command on {} did not complete within {:?}, replying FAIL", topic, MQTT_COMMAND_TIMEOUT);
+                                                        mqtt_msg
+                                                            .send_message(&topic, "FAIL", false)
+                                                            .await
+                                                            .with_context(|| "Failed to publish command timeout FAIL")
+                                                    }
+                                                };
                                                 if res.is_err() {
                                                     tx.send(res).await?;
                                                 }
@@ -401,6 +460,56 @@ async fn listen_on_camera(camera: NeoInstance, mqtt_instance: MqttInstance) -> R
                     } => {
                         v
                     },
+                    // Apply the newest requested PIR state; a request made while the
+                    // camera is unreachable is held until it connects, a superseded
+                    // request is dropped without being applied
+                    v = async {
+                        let mut pir_watch = pir_commands.subscribe();
+                        loop {
+                            let request = pir_watch.wait_for(|state| {
+                                state.request.map_or(false, |request| {
+                                    state.resolution.map_or(true, |resolution| resolution.seq < request.seq)
+                                })
+                            }).await.with_context(|| {
+                                format!("{}: PIR request watch dropped", camera_name)
+                            })?.request.expect("checked in wait_for");
+
+                            let desired = request.desired;
+                            let result = tokio::select! {
+                                v = camera_pir.run_task(move |cam| {
+                                    Box::pin(async move {
+                                        cam.pir_set(desired).await?;
+                                        AnyResult::Ok(())
+                                    })
+                                }) => Some(v),
+                                v = pir_watch.wait_for(|state| state.request.map_or(false, |newer| newer.seq != request.seq)) => {
+                                    v.with_context(|| {
+                                        format!("{}: PIR request watch dropped", camera_name)
+                                    })?;
+                                    None
+                                },
+                            };
+                            let ok = match result {
+                                None => continue,
+                                Some(Ok(())) => {
+                                    info!("{}: PIR turned {}", camera_name, if desired { "on" } else { "off" });
+                                    mqtt_pir.send_message("status/pir", if desired { "on" } else { "off" }, true).await.with_context(|| {
+                                        format!("{}: Failed to publish pir status", camera_name)
+                                    })?;
+                                    true
+                                }
+                                Some(Err(e)) => {
+                                    error!("{}: Failed to set pir: {:?}", camera_name, e);
+                                    false
+                                }
+                            };
+                            pir_commands.send_modify(|state| {
+                                if state.resolution.map_or(true, |resolution| resolution.seq < request.seq) {
+                                    state.resolution = Some(PirResolution { seq: request.seq, ok });
+                                }
+                            });
+                        }
+                    } => v,
                     // Handle the floodlight
                     v = async {
                         let (tx, mut rx) = mpsc(100);
@@ -645,6 +754,7 @@ async fn handle_mqtt_message(
     msg: MqttReply,
     mqtt: &MqttInstance,
     camera: &NeoInstance,
+    pir_commands: &watch::Sender<PirCommands>,
 ) -> Result<()> {
     match msg.as_ref() {
         MqttReplyRef {
@@ -1025,47 +1135,13 @@ async fn handle_mqtt_message(
             topic: "control/pir",
             message: "on",
         } => {
-            let res = camera
-                .run_task(|cam| {
-                    Box::pin(async move {
-                        cam.pir_set(true).await?;
-                        AnyResult::Ok(())
-                    })
-                })
-                .await;
-            let reply = if res.is_err() {
-                error!("Failed to turn on the pir: {:?}", res.err());
-                "FAIL"
-            } else {
-                "OK"
-            }
-            .to_string();
-            mqtt.send_message("control/pir", &reply, false)
-                .await
-                .with_context(|| "Failed to publish pir on")?;
+            handle_pir_request(true, mqtt, pir_commands).await?;
         }
         MqttReplyRef {
             topic: "control/pir",
             message: "off",
         } => {
-            let res = camera
-                .run_task(|cam| {
-                    Box::pin(async move {
-                        cam.pir_set(false).await?;
-                        AnyResult::Ok(())
-                    })
-                })
-                .await;
-            let reply = if res.is_err() {
-                error!("Failed to turn off the pir: {:?}", res.err());
-                "FAIL"
-            } else {
-                "OK"
-            }
-            .to_string();
-            mqtt.send_message("control/pir", &reply, false)
-                .await
-                .with_context(|| "Failed to publish pir off")?;
+            handle_pir_request(false, mqtt, pir_commands).await?;
         }
         MqttReplyRef {
             topic: "control/wakeup",
@@ -1223,32 +1299,15 @@ async fn handle_mqtt_message(
                 .await;
             let reply = match res {
                 Err(e) => {
-                    error!("Failed to get pir xml: {:?}", e);
+                    error!("Failed to get pir state: {:?}", e);
                     "FAIL"
                 }
                 Ok(xml) => {
-                    let ser_xml = {
-                        let mut buf = bytes::BytesMut::new();
-                        quick_xml::se::to_writer(&mut buf, &xml).map(|_| buf.to_vec())
-                    };
-                    match ser_xml {
-                        Ok(bytes) => match String::from_utf8(bytes) {
-                            Ok(str) => {
-                                mqtt.send_message("status/pir", &str, false)
-                                    .await
-                                    .with_context(|| "Failed to publish pir info")?;
-                                "OK"
-                            }
-                            Err(_) => {
-                                error!("Failed to encode pir status");
-                                "FAIL"
-                            }
-                        },
-                        Err(_) => {
-                            error!("Failed to serialise pir status");
-                            "FAIL"
-                        }
-                    }
+                    let state = if xml.enable == 0 { "off" } else { "on" };
+                    mqtt.send_message("status/pir", state, true)
+                        .await
+                        .with_context(|| "Failed to publish pir info")?;
+                    "OK"
                 }
             }
             .to_string();
@@ -1340,5 +1399,37 @@ async fn handle_mqtt_message(
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Record a `control/pir` message as the camera's desired PIR state and wait
+/// for the PIR task in [`listen_on_camera`] to resolve it
+///
+/// The request stays pending until the camera is reachable, even past the
+/// dispatcher's `FAIL` timeout on this handler; a newer request supersedes it
+async fn handle_pir_request(
+    desired: bool,
+    mqtt: &MqttInstance,
+    pir_commands: &watch::Sender<PirCommands>,
+) -> Result<()> {
+    let mut seq = 0;
+    pir_commands.send_modify(|state| {
+        seq = state.request.map_or(0, |request| request.seq) + 1;
+        state.request = Some(PirRequest { desired, seq });
+    });
+    let ok = pir_commands
+        .subscribe()
+        .wait_for(|state| {
+            state
+                .resolution
+                .map_or(false, |resolution| resolution.seq >= seq)
+        })
+        .await
+        .map(|state| state.resolution.map_or(false, |resolution| resolution.ok))
+        .unwrap_or(false);
+    let reply = if ok { "OK" } else { "FAIL" };
+    mqtt.send_message("control/pir", reply, false)
+        .await
+        .with_context(|| "Failed to publish pir reply")?;
     Ok(())
 }
